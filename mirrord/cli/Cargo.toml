@@ -80,6 +80,7 @@ itertools = { workspace = true, optional = true }
 yamlpatch.workspace = true
 yamlpath.workspace = true
 oci-spec.workspace = true
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 rand.workspace = true

@@ -19,6 +19,7 @@ pub enum AnalyticValue {
     Number(u32),
     Uuid(Uuid),
     Nested(Analytics),
+    Hash(AnalyticsHash),
 }
 
 #[derive(Default, Debug, Serialize, Deserialize, Clone, Copy)]
@@ -42,6 +43,7 @@ pub enum ExecutionKind {
     PortForward = 3,
     Dump = 4,
     Wizard = 5,
+    Preview = 6,
     Other = 0,
 }
 
@@ -53,6 +55,7 @@ impl From<u32> for ExecutionKind {
             3 => ExecutionKind::PortForward,
             4 => ExecutionKind::Dump,
             5 => ExecutionKind::Wizard,
+            6 => ExecutionKind::Preview,
             _ => ExecutionKind::Other,
         }
     }
@@ -174,6 +177,12 @@ impl From<usize> for AnalyticValue {
 impl From<Uuid> for AnalyticValue {
     fn from(id: Uuid) -> Self {
         AnalyticValue::Uuid(id)
+    }
+}
+
+impl From<AnalyticsHash> for AnalyticValue {
+    fn from(hash: AnalyticsHash) -> Self {
+        AnalyticValue::Hash(hash)
     }
 }
 
@@ -360,6 +369,7 @@ async fn send_analytics(report: AnalyticsReport) {
 mod tests {
     use assert_json_diff::assert_json_eq;
     use serde_json::json;
+    use uuid::Uuid;
 
     use super::*;
     /// this tests creates a struct that is flatten and one that is nested
@@ -399,6 +409,19 @@ mod tests {
                     "d": true,
                     "e": true
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn hash_value_serialization() {
+        let mut analytics = Analytics::default();
+        analytics.add("preview_key_identifier", AnalyticsHash::from_bytes(b"key"));
+
+        assert_json_eq!(
+            analytics,
+            json!({
+                "preview_key_identifier": "a2V5"
             })
         );
     }

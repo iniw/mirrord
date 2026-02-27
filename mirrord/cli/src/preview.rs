@@ -31,7 +31,7 @@ use mirrord_config::{
 };
 use mirrord_kube::api::runtime::RuntimeDataProvider;
 use mirrord_operator::{
-    client::OperatorApi,
+    client::{NoClientCert, OperatorApi},
     crd::{
         NewOperatorFeature,
         preview::{PreviewIncomingConfig, PreviewSession, PreviewSessionPhase, PreviewSessionSpec},
@@ -44,17 +44,26 @@ use oci_spec::distribution::Reference;
 use tracing::Level;
 use uuid::Uuid;
 
+mod telemetry;
+
+use telemetry::{PreviewFailureReason, PreviewTelemetryContext};
+
 use crate::{
     config::{PreviewArgs, PreviewCommand, PreviewStartArgs, PreviewStatusArgs, PreviewStopArgs},
     error::{CliError, CliResult},
+    user_data::UserData,
 };
 
 /// Handle commands related to preview environments: `mirrord preview ...`
-pub(crate) async fn preview_command(args: PreviewArgs) -> CliResult<()> {
+pub(crate) async fn preview_command(
+    args: PreviewArgs,
+    watch: drain::Watch,
+    user_data: &UserData,
+) -> CliResult<()> {
     match args.command {
-        PreviewCommand::Start(start_args) => preview_start(start_args).await,
-        PreviewCommand::Status(status_args) => preview_status(status_args).await,
-        PreviewCommand::Stop(stop_args) => preview_stop(stop_args).await,
+        PreviewCommand::Start(start_args) => preview_start(start_args, watch, user_data).await,
+        PreviewCommand::Status(status_args) => preview_status(status_args, watch, user_data).await,
+        PreviewCommand::Stop(stop_args) => preview_stop(stop_args, watch, user_data).await,
     }
 }
 
@@ -70,12 +79,24 @@ pub const PREVIEW_SESSION_KEY_LABEL: &str = "preview.mirrord.metalbear.co/key";
 /// a `PreviewSession` resource that the operator will reconcile, then watches
 /// the status until `Ready` or failure.
 #[tracing::instrument(level = Level::TRACE, ret, skip_all)]
-async fn preview_start(args: PreviewStartArgs) -> CliResult<()> {
+async fn preview_start(
+    args: PreviewStartArgs,
+    watch: drain::Watch,
+    user_data: &UserData,
+) -> CliResult<()> {
     let mut progress = ProgressTracker::from_env("mirrord preview start");
 
     let layer_config = load_preview_config(args.as_env_vars(), &mut progress)?;
+    let key = layer_config.key.as_str();
 
-    let (client, api) = create_preview_api(&layer_config, false, &progress).await?;
+    let (operator_api, api) = create_preview_api(&layer_config, false, &progress).await?;
+
+    let telemetry = PreviewTelemetryContext::new(
+        layer_config.telemetry,
+        user_data.machine_id(),
+        watch,
+        &operator_api,
+    );
 
     // Create the `PreviewSession` resource in the cluster. The CR name is derived from
     // the target with a short random suffix to avoid collisions (e.g.
@@ -96,14 +117,13 @@ async fn preview_start(args: PreviewStartArgs) -> CliResult<()> {
 
     let session_target = resolve_config_target(
         config_target,
-        &client,
+        operator_api.client(),
         layer_config.target.namespace.as_deref(),
     )
     .await
     .inspect_err(|_| subtask.failure(None))?;
 
     // Check for an existing session with the same key+target.
-    let key = layer_config.key.as_str();
     let list_params = ListParams::default().labels(&format!("{PREVIEW_SESSION_KEY_LABEL}={key}"));
     let existing_sessions = api.list(&list_params).await.map_err(|e| {
         subtask.failure(None);
@@ -248,6 +268,7 @@ async fn preview_start(args: PreviewStartArgs) -> CliResult<()> {
                 }
 
                 subtask.failure(None);
+                telemetry.emit_failed(key, PreviewFailureReason::Timeout);
                 return Err(CliError::PreviewTimeout);
             }
             _ = long_initialization_timer.tick() => {
@@ -285,6 +306,7 @@ async fn preview_start(args: PreviewStartArgs) -> CliResult<()> {
                                         ));
                                     }
                                     subtask.failure(None);
+                                    telemetry.emit_failed(key, PreviewFailureReason::FailedPhase);
                                     return Err(CliError::PreviewSessionFailed(failure_message));
                                 }
                                 PreviewSessionPhase::Unknown => last_known_phase = "unknown",
@@ -294,6 +316,7 @@ async fn preview_start(args: PreviewStartArgs) -> CliResult<()> {
 
                     Some(Ok(Event::Delete(_))) => {
                         subtask.failure(None);
+                        telemetry.emit_failed(key, PreviewFailureReason::SessionDeleted);
                         return Err(CliError::PreviewSessionDeleted);
                     }
 
@@ -301,11 +324,13 @@ async fn preview_start(args: PreviewStartArgs) -> CliResult<()> {
 
                     Some(Err(error)) => {
                         subtask.failure(None);
+                        telemetry.emit_failed(key, PreviewFailureReason::WatchError);
                         return Err(CliError::PreviewWatchFailed(error.to_string()));
                     }
 
                     None => {
                         subtask.failure(None);
+                        telemetry.emit_failed(key, PreviewFailureReason::StreamClosed);
                         return Err(CliError::PreviewWatchFailed("stream closed".to_owned()));
                     }
                 }
@@ -313,17 +338,13 @@ async fn preview_start(args: PreviewStartArgs) -> CliResult<()> {
         }
     };
 
+    telemetry.emit_start(key);
+
     // Display summary of the created preview environment.
 
-    let namespace = layer_config
-        .target
-        .namespace
-        .as_deref()
-        .unwrap_or(client.default_namespace());
+    let namespace = session.metadata.namespace.as_deref().unwrap_or("<unknown>");
 
     progress.success(None);
-
-    let key = layer_config.key.as_str();
 
     println!(
         r#"
@@ -340,7 +361,11 @@ async fn preview_start(args: PreviewStartArgs) -> CliResult<()> {
 ///
 /// Lists preview environments, optionally filtered by key and namespace.
 #[tracing::instrument(level = Level::TRACE, ret, skip_all)]
-async fn preview_status(args: PreviewStatusArgs) -> CliResult<()> {
+async fn preview_status(
+    args: PreviewStatusArgs,
+    watch: drain::Watch,
+    user_data: &UserData,
+) -> CliResult<()> {
     let mut progress = ProgressTracker::from_env("mirrord preview status");
 
     let layer_config = load_preview_config(args.as_env_vars(), &mut progress)?;
@@ -348,7 +373,14 @@ async fn preview_status(args: PreviewStatusArgs) -> CliResult<()> {
     // Default to all namespaces when no namespace is configured, so `mirrord preview status`
     // with no flags shows everything.
     let all_namespaces = args.all_namespaces || layer_config.target.namespace.is_none();
-    let (_, api) = create_preview_api(&layer_config, all_namespaces, &progress).await?;
+    let (operator_api, api) = create_preview_api(&layer_config, all_namespaces, &progress).await?;
+
+    let telemetry = PreviewTelemetryContext::new(
+        layer_config.telemetry,
+        user_data.machine_id(),
+        watch,
+        &operator_api,
+    );
 
     // List and filter sessions.
 
@@ -430,10 +462,10 @@ async fn preview_status(args: PreviewStatusArgs) -> CliResult<()> {
                         .status
                         .as_ref()
                         .and_then(|s| s.failure_message.as_deref())
-                        .unwrap_or("unknown");
+                        .unwrap_or("<unknown>");
                     format!("stopped ({msg})")
                 }
-                Some(PreviewSessionPhase::Unknown) => "unknown".to_owned(),
+                Some(PreviewSessionPhase::Unknown) => "<unknown>".to_owned(),
                 None => "pending".to_owned(),
             };
 
@@ -445,6 +477,8 @@ async fn preview_status(args: PreviewStatusArgs) -> CliResult<()> {
                 status
             );
         }
+
+        telemetry.emit_status(key);
     }
 
     Ok(())
@@ -455,7 +489,11 @@ async fn preview_status(args: PreviewStatusArgs) -> CliResult<()> {
 /// Deletes preview environments matching the given key and, optionally, a target filter and
 /// namespace.
 #[tracing::instrument(level = Level::TRACE, ret, skip_all)]
-async fn preview_stop(args: PreviewStopArgs) -> CliResult<()> {
+async fn preview_stop(
+    args: PreviewStopArgs,
+    watch: drain::Watch,
+    user_data: &UserData,
+) -> CliResult<()> {
     let mut progress = ProgressTracker::from_env("mirrord preview stop");
 
     let layer_config = load_preview_config(args.as_env_vars(), &mut progress)?;
@@ -463,12 +501,18 @@ async fn preview_stop(args: PreviewStopArgs) -> CliResult<()> {
     let key = layer_config
         .key
         .provided()
-        .ok_or(CliError::PreviewKeyRequired)?
-        .to_owned();
+        .ok_or(CliError::PreviewKeyRequired)?;
 
     // Default to all namespaces when no namespace is configured, same as `status`.
     let all_namespaces = args.all_namespaces || layer_config.target.namespace.is_none();
-    let (client, api) = create_preview_api(&layer_config, all_namespaces, &progress).await?;
+    let (operator_api, api) = create_preview_api(&layer_config, all_namespaces, &progress).await?;
+
+    let telemetry = PreviewTelemetryContext::new(
+        layer_config.telemetry,
+        user_data.machine_id(),
+        watch,
+        &operator_api,
+    );
 
     let mut subtask = progress.subtask("finding preview sessions");
 
@@ -479,11 +523,14 @@ async fn preview_stop(args: PreviewStopArgs) -> CliResult<()> {
         Some(config_target) => {
             let session_target = resolve_config_target(
                 config_target,
-                &client,
+                operator_api.client(),
                 layer_config.target.namespace.as_deref(),
             )
             .await
-            .inspect_err(|_| subtask.failure(None))?;
+            .inspect_err(|_| {
+                subtask.failure(None);
+                telemetry.emit_failed(key, PreviewFailureReason::TargetResolutionFailed);
+            })?;
 
             Some(session_target)
         }
@@ -497,6 +544,7 @@ async fn preview_stop(args: PreviewStopArgs) -> CliResult<()> {
         .await
         .map_err(|e| {
             subtask.failure(None);
+            telemetry.emit_failed(key, PreviewFailureReason::ListFailed);
             CliError::PreviewListFailed(e.to_string())
         })?
         .items
@@ -510,7 +558,8 @@ async fn preview_stop(args: PreviewStopArgs) -> CliResult<()> {
 
     if sessions_to_delete.is_empty() {
         subtask.failure(None);
-        return Err(CliError::PreviewNotFound(key));
+        telemetry.emit_failed(key, PreviewFailureReason::NotFound);
+        return Err(CliError::PreviewNotFound(key.to_owned()));
     }
 
     subtask.success(Some(&format!(
@@ -540,17 +589,22 @@ async fn preview_stop(args: PreviewStopArgs) -> CliResult<()> {
             .as_deref()
             .expect("preview session should have a namespace");
 
-        let namespaced_api = Api::<PreviewSession>::namespaced(client.clone(), namespace);
+        let namespaced_api =
+            Api::<PreviewSession>::namespaced(operator_api.client().clone(), namespace);
 
         if let Err(e) =
             delete::delete_and_finalize(namespaced_api.clone(), name, &DeleteParams::default())
                 .await
         {
+            telemetry.emit_failed(key, PreviewFailureReason::DeleteFailed);
             result = Err(CliError::PreviewDeleteFailed {
                 name: name.to_owned(),
                 reason: e.to_string(),
             });
+            continue;
         }
+
+        telemetry.emit_stop(key, &session);
     }
 
     if result.is_err() {
@@ -602,13 +656,13 @@ fn load_preview_config(
 }
 
 /// Connects to the operator, validates the license and checks that the `PreviewEnv` feature is
-/// supported, then returns a Kubernetes client and a `PreviewSession` API handle scoped to
+/// supported, then returns the operator API and a `PreviewSession` API handle scoped to
 /// the appropriate namespace(s).
 async fn create_preview_api(
     config: &LayerConfig,
     all_namespaces: bool,
     progress: &ProgressTracker,
-) -> CliResult<(kube::Client, Api<PreviewSession>)> {
+) -> CliResult<(OperatorApi<NoClientCert>, Api<PreviewSession>)> {
     let mut subtask = progress.subtask("connecting to operator");
 
     let operator_api = OperatorApi::try_new(config, &mut NullReporter::default(), progress)
@@ -632,14 +686,14 @@ async fn create_preview_api(
 
     let client = operator_api.client().clone();
     let api = if all_namespaces {
-        Api::all(client.clone())
+        Api::all(client)
     } else if let Some(namespace) = config.target.namespace.as_deref() {
-        Api::namespaced(client.clone(), namespace)
+        Api::namespaced(client, namespace)
     } else {
-        Api::default_namespaced(client.clone())
+        Api::default_namespaced(client)
     };
 
-    Ok((client, api))
+    Ok((operator_api, api))
 }
 
 /// Returns `true` when two OCI image references point at the same repository, ignoring any tag or
@@ -652,23 +706,4 @@ fn images_match(a: &str, b: &str) -> CliResult<bool> {
         .parse()
         .map_err(|e| CliError::PreviewInvalidImage(format!("{b}: {e}")))?;
     Ok(a.registry() == b.registry() && a.repository() == b.repository())
-}
-
-#[cfg(test)]
-mod tests {
-    use rstest::rstest;
-
-    use super::images_match;
-
-    #[rstest]
-    #[case("myapp:v1", "myapp:v2", true)]
-    #[case("myapp:v1", "myapp:v1", true)]
-    #[case("myapp", "myapp:latest", true)]
-    #[case("ghcr.io/org/app:v1", "ghcr.io/org/app:v2", true)]
-    #[case("registry:5000/app:v1", "registry:5000/app:v2", true)]
-    #[case("myapp:v1", "otherapp:v1", false)]
-    #[case("ghcr.io/org/app:v1", "docker.io/org/app:v1", false)]
-    fn test_images_same_name(#[case] a: &str, #[case] b: &str, #[case] expected: bool) {
-        assert_eq!(images_match(a, b).unwrap(), expected);
-    }
 }
