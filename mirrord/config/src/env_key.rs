@@ -17,6 +17,7 @@ pub const MIRRORD_ENV_KEY: &str = "MIRRORD_KEY";
 // Distinguishes between user-provided keys (from CLI or config file)
 // and auto-generated keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum EnvKey {
     // Key provided by user via CLI argument or config file.
     Provided(String),
